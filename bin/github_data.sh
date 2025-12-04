@@ -1,11 +1,11 @@
 # commit to csv_data
 #!/usr/bin/env bash
 
-URL=https://github.com/thanhnhu/vietlott.git
+URL=https://github.com/khanhduong1303/vietlott.git
 FOLDER=vietlott
 DATA_FOLDER=data
-USER="thanhnhu"
-EMAIl="thanhnhudn@gmail.com"
+USER="khanhduong1303"
+EMAIl="khanhduong1303@gmail.com"
 
 # generate data file
 echo "pwd $(pwd)"
@@ -21,8 +21,8 @@ python src/vietlott/cli/crawl.py power_655
 python src/vietlott/cli/missing.py power_655
 python src/vietlott/cli/crawl.py power_645
 python src/vietlott/cli/missing.py power_645
-#python src/vietlott/cli/crawl.py keno
-#python src/vietlott/cli/missing.py keno
+#python src/vietlott/cli/crawl.py power_535
+#python src/vietlott/cli/missing.py power_535
 
 python src/render_readme.py
 
