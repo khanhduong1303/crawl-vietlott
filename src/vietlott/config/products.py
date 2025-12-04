@@ -40,6 +40,15 @@ power645_config = ProductConfig(
     interval=timedelta(days=2),
     use_cookies=False,
 )
+power535_config = ProductConfig(
+    name="power_535",
+    raw_path=data_dir / "power535.jsonl",
+    min_value=1,
+    max_value=35,
+    size_output=5,
+    interval=timedelta(days=2),
+    use_cookies=False,
+)
 keno_config = ProductConfig(
     name="keno",
     raw_path=data_dir / "keno.jsonl",
@@ -53,7 +62,7 @@ keno_config = ProductConfig(
     use_cookies=False,
 )
 
-product_config_map = {c.name: c for c in [power645_config, power655_config, keno_config]}
+product_config_map = {c.name: c for c in [power645_config, power655_config, power535_config, keno_config]}
 
 
 def get_config(name: str) -> ProductConfig:
