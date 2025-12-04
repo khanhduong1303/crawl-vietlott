@@ -21,8 +21,8 @@ python src/vietlott/cli/crawl.py power_655
 python src/vietlott/cli/missing.py power_655
 python src/vietlott/cli/crawl.py power_645
 python src/vietlott/cli/missing.py power_645
-#python src/vietlott/cli/crawl.py power_535
-#python src/vietlott/cli/missing.py power_535
+python src/vietlott/cli/crawl.py power_535
+python src/vietlott/cli/missing.py power_535
 
 python src/render_readme.py
 
