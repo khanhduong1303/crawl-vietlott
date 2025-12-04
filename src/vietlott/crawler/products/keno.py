@@ -4,14 +4,14 @@ import pendulum
 from bs4 import BeautifulSoup
 
 from vietlott.crawler.products.power655 import ProductPower655
-from vietlott.crawler.schema.requests import Keno
+from vietlott.crawler.schema.requests import RequestKeno
 
 
 class ProductKeno(ProductPower655):
     name = "keno"
     url = "https://vietlott.vn/ajaxpro/Vietlott.PlugIn.WebParts.GameKenoCompareWebPart,Vietlott.PlugIn.WebParts.ashx"
 
-    org_body = Keno(
+    org_body = RequestKeno(
         DrawDate="",
         GameDrawNo="",
         GameId="6",
