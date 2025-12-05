@@ -9,12 +9,13 @@ from loguru import logger
 import os, sys
 sys.path.append(os.path.dirname(os.path.abspath('src/vietlott')))
 from vietlott.config.products import product_config_map, ProductConfig
-from vietlott.crawler.products import BaseProduct, ProductPower655, ProductPower645, ProductKeno
+from vietlott.crawler.products import BaseProduct, ProductPower655, ProductPower645, ProductPower535, ProductKeno
 
 _map_class_name = {
     "keno": ProductKeno,
     "power_655": ProductPower655,
     "power_645": ProductPower645,
+    "power_535": ProductPower535,
 }
 
 

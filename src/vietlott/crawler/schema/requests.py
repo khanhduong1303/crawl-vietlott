@@ -38,6 +38,21 @@ class RequestPower655:
 
 
 @define
+class RequestPower535:
+    """
+    Request Power 535
+    """
+
+    # Request Power 535
+    ORenderInfo: ORenderInfoCls = field(default=ORenderInfoCls())
+    Key: str = field(default="")
+    GameDrawId: str = field(default="")
+    ArrayNumbers: List[List[str]] = field(default=[[]])
+    CheckMulti: bool = field(default=False)
+    PageIndex: int = field(default=1)
+
+
+@define
 class Keno:
     DrawDate: str = field(default="")
     GameDrawNo: str = field(default="")
