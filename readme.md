@@ -159,3 +159,7 @@ Options:
   --help           Show this message and exit.
 ```
 
+### Fetch power535
+```shell
+. .venv/bin/activate && PYTHONPATH=src python3 src/vietlott/cli/crawl.py power_535 --index_from 0 --index_to 1
+```
