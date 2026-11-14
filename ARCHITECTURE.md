@@ -14,6 +14,12 @@ Key points:
 - cookies used to needed to crawl but not anymore (disabled for all products)
 - data on website are in [pages](https://vietlott.vn/vi/trung-thuong/ket-qua-trung-thuong/winning-number-655) so the fetching are designed around that mechanism (also the detect missing and back-filled mechanism at [missing.py](https://github.com/vietvudanh/vietlott-data/blob/89c6aaa632011c6ef248e43178f38e05daeee1b9/src/vietlott/cli/missing.py#L22))  
 
+## crawling & blocking
+
+Vietlott sits behind Cloudflare, so a direct call from GitHub Actions gets a 403
+challenge page and the crawler has to go through Vietnamese residential proxies.
+See [docs/crawling.md](docs/crawling.md) for the evidence and which approaches work.
+
 ## runner
 
 The project uses Github Actions with [config](https://github.com/vietvudanh/vietlott-data/blob/master/.github/workflows/crawl.yaml) 
