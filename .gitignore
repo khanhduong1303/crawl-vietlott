@@ -161,3 +161,6 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
 .ruff_cache
+
+# local helper script (personal push), not part of the project
+push-personal.sh
