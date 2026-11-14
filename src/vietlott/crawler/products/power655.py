@@ -136,6 +136,7 @@ class ProductPower655(BaseProduct):
             self.cookies,
         )
 
+        fetch.reset_failures()
         results = pool.map(fetch_fn, tasks)
 
         # flatten results, as it is 3 level deep
@@ -149,6 +150,14 @@ class ProductPower655(BaseProduct):
         for date, date_items in date_dict.items():
             list_data += date_items
         if len(list_data) == 0:
+            # Phan biet 2 truong hop truoc gio bi gop lam mot:
+            #   - khong co ky quay moi  -> binh thuong, 8 lan crawl/ngay ma tuan quay 3 lan
+            #   - moi request deu fail  -> hong that, phai bao loi
+            if fetch.get_failures():
+                raise RuntimeError(
+                    f"khong lay duoc du lieu nao, {len(fetch.get_failures())} task that bai: "
+                    f"{fetch.get_failures()}"
+                )
             logger.info("No results")
             return
         df_crawled = pd.DataFrame(list_data)
@@ -180,3 +189,13 @@ class ProductPower655(BaseProduct):
         )
         df_final.to_json(self.product_config.raw_path.absolute(), orient="records", lines=True)
         logger.info(f"wrote to file {self.product_config.raw_path.absolute()}")
+
+        # Lay duoc du lieu roi thi mot vai task hong KHONG lam job do: cac task sau
+        # chi doc trang lich su, va proxy free von chap chon. Chi canh bao de con dau vet.
+        # Truong hop that su hong (khong lay duoc gi) da duoc bat o nhanh "No results" tren.
+        failures = fetch.get_failures()
+        if failures:
+            logger.warning(
+                f"{len(failures)} task that bai: {failures}. Da ghi phan lay duoc; "
+                f"chay missing.py de kiem tra ky quay bi thieu."
+            )

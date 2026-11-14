@@ -26,12 +26,16 @@ if [[ "$BRANCH" == "master" ]]; then
   sleep "$RANDOM_DELAY"
 fi
 
+# Mot san pham fail KHONG duoc chan 2 san pham con lai, va phan du lieu da lay
+# duoc van phai duoc commit. Vi vay gom loi lai, cuoi script moi thoat voi exit != 0.
+FAILED=""
+
 for product in power_655 power_645 power_535; do
-  python src/vietlott/cli/crawl.py "$product"
-  python src/vietlott/cli/missing.py "$product"
+  python src/vietlott/cli/crawl.py "$product"   || FAILED="$FAILED crawl:$product"
+  python src/vietlott/cli/missing.py "$product" || FAILED="$FAILED missing:$product"
 done
 
-python src/render_readme.py
+python src/render_readme.py || FAILED="$FAILED render_readme"
 
 # ----- commit va push -----
 git config user.name  "$GIT_USER"
@@ -43,12 +47,21 @@ git status --short
 if git diff --cached --quiet; then
   # Khong co ky quay moi la chuyen BINH THUONG (crawl 8 lan/ngay, quay 3 lan/tuan).
   echo "khong co du lieu moi -> bo qua commit/push"
-  exit 0
+else
+  git commit -m "update data @ $(date +'%Y-%m-%d %H:%M:%S')"
+
+  # Remote co the da co commit moi trong luc job dang chay (vd: push tay).
+  # Ban cu push thang -> bi reject 'fetch first' va job do oan.
+  git pull --rebase origin "$BRANCH"
+  git push origin "$BRANCH"
 fi
 
-git commit -m "update data @ $(date +'%Y-%m-%d %H:%M:%S')"
+if [[ -n "$FAILED" ]]; then
+  echo "=============================================="
+  echo "CAC BUOC THAT BAI:$FAILED"
+  echo "Du lieu lay duoc (neu co) da duoc commit o tren."
+  echo "=============================================="
+  exit 1
+fi
 
-# Remote co the da co commit moi trong luc job dang chay (vd: push tay).
-# Ban cu push thang -> bi reject 'fetch first' va job do oan.
-git pull --rebase origin "$BRANCH"
-git push origin "$BRANCH"
+echo "tat ca cac buoc thanh cong"

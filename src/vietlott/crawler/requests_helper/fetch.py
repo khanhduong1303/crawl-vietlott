@@ -4,6 +4,7 @@ fetch data utilities
 
 import re
 import threading
+import time
 from io import StringIO
 from typing import Callable, List, Optional, Tuple
 
@@ -23,8 +24,29 @@ PREFERRED_COUNTRY = "VN"
 # thi mot lan crawl co the keo dai hang gio -> bat buoc phai gioi han.
 MAX_PROXIES_TO_TRY = 25
 
+# Proxy free chet rat nhanh, pool VN thay doi tung phut -> neu vong dau that bai
+# thi lay lai danh sach moi roi thu them mot vong nua.
+PROXY_ATTEMPTS = 3
+
+# Lay lai danh sach ngay lap tuc thuong tra ve dung ban cu; cho mot chut de
+# free-proxy-list.net kip cap nhat (pool VN co luc tut tu 7 xuong 1 trong 1 gio).
+PROXY_RETRY_SLEEP = 10
+
+# Proxy chet thuong chet ngay o buoc connect -> tach timeout connect cho ngan,
+# giu timeout doc du dai cho proxy cham nhung song.
+CONNECT_TIMEOUT = 6
+
+# Chan tren thoi gian cho MOT task. Khong co cai nay thi truong hop xau nhat la
+# PROXY_ATTEMPTS x MAX_PROXIES_TO_TRY x TIMEOUT = hang chuc phut cho moi task.
+TASK_TIME_BUDGET = 120
+
 bad_proxies = []
 lock = threading.Lock()
+
+# Task lay du lieu that bai. KHONG raise ngay giua chung vi se mat luon phan
+# du lieu cac task khac da lay duoc; thay vao do ghi nhan lai, de crawl()
+# ghi file xong roi moi bao loi.
+failed_tasks = []
 
 # get_proxies() duoc goi nhieu lan trong mot lan chay -> cache lai de khong
 # spam free-proxy-list.net va de thu tu proxy on dinh giua cac task.
@@ -154,8 +176,6 @@ def fetch_wrapper(
         tasks_str = ",".join(str(t["task_id"]) for t in tasks)
         logger.debug(f"worker start, tasks_ids={tasks_str}")
         _headers = headers.copy()
-        # using proxy to avoid ban github ip
-        all_proxies = get_proxies()
 
         results = []
         for task in tasks:
@@ -166,63 +186,92 @@ def fetch_wrapper(
             params.update(task_data["params"])
             body.update(task_data["body"])
 
-            candidates = [p for p in all_proxies if p not in bad_proxies][:MAX_PROXIES_TO_TRY]
-            if not candidates:
-                logger.error(f"task {task_id}: khong con proxy nao kha dung (bad list={len(bad_proxies)})")
-                continue
-
             done = False
-            for str_proxy in candidates:
-                proxy = {"http": str_proxy, "https": str_proxy}
+            deadline = time.monotonic() + TASK_TIME_BUDGET
+            for attempt in range(PROXY_ATTEMPTS):
+                if time.monotonic() > deadline:
+                    logger.warning(f"task {task_id}: het {TASK_TIME_BUDGET}s ngan sach thoi gian")
+                    break
+                if attempt > 0:
+                    time.sleep(PROXY_RETRY_SLEEP)
+                # using proxy to avoid ban github ip
+                # tu vong 2 tro di lay lai danh sach proxy moi thay vi dung ban cache
+                all_proxies = get_proxies(force_refresh=True) if attempt else get_proxies()
+                candidates = [p for p in all_proxies if p not in bad_proxies][:MAX_PROXIES_TO_TRY]
 
-                try:
-                    res = requests.post(
-                        url,
-                        json=body,
-                        params=params,
-                        headers=_headers,
-                        cookies=cookies,
-                        timeout=TIMEOUT,
-                        proxies=proxy,
+                if not candidates:
+                    logger.warning(
+                        f"task {task_id}: khong con proxy kha dung o lan {attempt + 1}/{PROXY_ATTEMPTS} "
+                        f"(bad list={len(bad_proxies)})"
                     )
+                    continue
 
-                    if not res.ok:
-                        banned_message = "You are unable to access"
-                        if banned_message in res.text:
-                            logger.error(
-                                f"req failed, args={task_data}, code={res.status_code}, "
-                                f"proxy={str_proxy}, res='Banned IP!!!'"
-                            )
-                        else:
-                            logger.error(
-                                f"req failed, args={task_data}, code={res.status_code}, "
-                                f"proxy={str_proxy}, res={res.text[:200]}"
-                            )
-                        add_to_bad_list(str_proxy)
-                        continue
+                for str_proxy in candidates:
+                    if time.monotonic() > deadline:
+                        logger.warning(f"task {task_id}: het ngan sach thoi gian giua vong proxy")
+                        break
+                    proxy = {"http": str_proxy, "https": str_proxy}
 
                     try:
-                        result = process_result_fn(params, body, res.json(), task_data)
-                        results.append(result)
-                        logger.debug(f"task {task_id}, proxy={str_proxy} done")
-                        done = True
-                        break  # break the proxy loop
-                    except Exception as error:
-                        logger.error(
-                            f"{type(error).__name__}, args={task_data}, text={res.text[:200]}, "
-                            f"headers={headers}, cookies={cookies}, body={body}, params={params}"
+                        res = requests.post(
+                            url,
+                            json=body,
+                            params=params,
+                            headers=_headers,
+                            cookies=cookies,
+                            timeout=(CONNECT_TIMEOUT, TIMEOUT),
+                            proxies=proxy,
                         )
+
+                        if not res.ok:
+                            banned_message = "You are unable to access"
+                            if banned_message in res.text:
+                                logger.error(
+                                    f"req failed, args={task_data}, code={res.status_code}, "
+                                    f"proxy={str_proxy}, res='Banned IP!!!'"
+                                )
+                            else:
+                                logger.error(
+                                    f"req failed, args={task_data}, code={res.status_code}, "
+                                    f"proxy={str_proxy}, res={res.text[:200]}"
+                                )
+                            add_to_bad_list(str_proxy)
+                            continue
+
+                        try:
+                            result = process_result_fn(params, body, res.json(), task_data)
+                            results.append(result)
+                            logger.debug(f"task {task_id}, proxy={str_proxy} done")
+                            done = True
+                            break  # break the proxy loop
+                        except Exception as error:
+                            logger.error(
+                                f"{type(error).__name__}, args={task_data}, text={res.text[:200]}, "
+                                f"headers={headers}, cookies={cookies}, body={body}, params={params}"
+                            )
+                            add_to_bad_list(str_proxy)
+
+                    # handle exception on request
+                    except Exception as error:
+                        logger.debug(f"{type(error).__name__}, task {task_id}, proxy={str_proxy}")
                         add_to_bad_list(str_proxy)
 
-                # handle exception on request
-                except Exception as error:
-                    logger.debug(f"{type(error).__name__}, task {task_id}, proxy={str_proxy}")
-                    add_to_bad_list(str_proxy)
+                if done:
+                    break
+
+                logger.warning(
+                    f"task {task_id}: thu het {len(candidates)} proxy o lan {attempt + 1}/{PROXY_ATTEMPTS}"
+                )
 
             if not done:
+                # KHONG duoc im lang bo qua: neu bo qua, crawl.py se in 'No results'
+                # y het nhu khi khong co ky quay moi -> job xanh ma du lieu thieu.
                 logger.error(
-                    f"task {task_id}: thu het {len(candidates)} proxy deu that bai"
+                    f"task {task_id}: khong lay duoc du lieu sau {PROXY_ATTEMPTS} vong proxy, "
+                    f"bad proxies={len(bad_proxies)}"
                 )
+                with lock:
+                    failed_tasks.append(task_id)
 
         logger.debug(f"worker done, tasks={tasks_str}")
         return results
@@ -234,3 +283,14 @@ def add_to_bad_list(item):
     with lock:
         if item not in bad_proxies:
             bad_proxies.append(item)
+
+
+def reset_failures():
+    """Goi truoc moi lan crawl de xoa ket qua cua lan truoc."""
+    with lock:
+        failed_tasks.clear()
+
+
+def get_failures() -> List:
+    with lock:
+        return list(failed_tasks)
