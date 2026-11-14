@@ -3,8 +3,10 @@ fetch data utilities
 """
 
 import re
+import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 from typing import Callable, List, Optional, Tuple
 
@@ -14,7 +16,14 @@ from loguru import logger
 
 from vietlott.crawler.requests_helper.config import TIMEOUT
 
-PROXY_LIST_URL = "https://free-proxy-list.net/"
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/117.0"
+
+# Timeout khi goi cac trang cung cap danh sach proxy
+SOURCE_TIMEOUT = 25
+
+# Sang loc proxy chet: bat tay TCP, chay song song
+ALIVE_TIMEOUT = 3
+SCREEN_WORKERS = 40
 
 # Vietlott chan IP datacenter nuoc ngoai (IP cua GitHub Actions nam trong so do),
 # nen uu tien proxy VN; proxy nuoc khac chi la phuong an cuoi.
@@ -22,7 +31,11 @@ PREFERRED_COUNTRY = "VN"
 
 # Moi proxy chet ton toi TIMEOUT giay. Danh sach co ~300 proxy, neu thu het
 # thi mot lan crawl co the keo dai hang gio -> bat buoc phai gioi han.
-MAX_PROXIES_TO_TRY = 25
+MAX_PROXIES_TO_TRY = 30
+
+# Nhan gia cho "khong dung proxy". Vong dau luon thu di thang mot lan de kiem
+# chung gia dinh 'IP GitHub bi Vietlott chan' - gia dinh nay chua ai kiem lai.
+DIRECT = "direct"
 
 # Proxy free chet rat nhanh, pool VN thay doi tung phut -> neu vong dau that bai
 # thi lay lai danh sach moi roi thu them mot vong nua.
@@ -64,6 +77,28 @@ def get_vietlott_cookie() -> Tuple[str, dict]:
     return cookie, cookies
 
 
+def _parse_host_port(raw: str):
+    raw = str(raw).strip()
+    if ":" not in raw:
+        return None
+    host, port = raw.rsplit(":", 1)
+    host = host.strip()
+    try:
+        port = str(int(float(port.strip())))
+    except (ValueError, TypeError):
+        return None
+    if not host:
+        return None
+    return host, port
+
+
+def _scheme_for(protocol: str) -> str:
+    protocol = str(protocol).strip().upper()
+    if protocol.startswith("SOCKS"):
+        return "socks5" if "5" in protocol else "socks4"
+    return "http"
+
+
 def _find_proxy_table(tables: List[pd.DataFrame]) -> pd.DataFrame:
     """
     free-proxy-list.net doi layout theo thoi gian: bang dau tien khong con la bang
@@ -77,46 +112,104 @@ def _find_proxy_table(tables: List[pd.DataFrame]) -> pd.DataFrame:
             return table
 
     raise ValueError(
-        f"khong tim thay bang proxy tren {PROXY_LIST_URL}, "
-        f"cac bang doc duoc: {[list(t.columns) for t in tables]}"
+        f"khong tim thay bang proxy, cac bang doc duoc: {[list(t.columns) for t in tables]}"
     )
 
 
-def _to_proxy_url(row: pd.Series) -> Optional[str]:
-    """Chuyen mot dong cua bang proxy thanh URL co scheme, vd http://1.2.3.4:8080"""
+def _source_free_proxy_list() -> List[str]:
+    resp = requests.get(
+        "https://free-proxy-list.net/",
+        timeout=SOURCE_TIMEOUT,
+        headers={"User-Agent": USER_AGENT},
+    )
+    resp.raise_for_status()
+    table = _find_proxy_table(pd.read_html(StringIO(resp.text)))
+    table = table[table["Code"] == PREFERRED_COUNTRY]
+
+    out = []
+    for _, row in table.iterrows():
+        raw = row["IP:Port"] if "IP:Port" in row.index else f"{row['IP Address']}:{row['Port']}"
+        parsed = _parse_host_port(raw)
+        if parsed:
+            scheme = _scheme_for(row["Protocol"]) if "Protocol" in row.index else "http"
+            out.append(f"{scheme}://{parsed[0]}:{parsed[1]}")
+    return out
+
+
+def _source_proxyscrape() -> List[str]:
+    out = []
+    for protocol in ("http", "socks4", "socks5"):
+        resp = requests.get(
+            "https://api.proxyscrape.com/v2/",
+            params={
+                "request": "displayproxies",
+                "protocol": protocol,
+                "timeout": 10000,
+                "country": PREFERRED_COUNTRY,
+            },
+            timeout=SOURCE_TIMEOUT,
+            headers={"User-Agent": USER_AGENT},
+        )
+        resp.raise_for_status()
+        for line in resp.text.splitlines():
+            parsed = _parse_host_port(line)
+            if parsed:
+                out.append(f"{_scheme_for(protocol)}://{parsed[0]}:{parsed[1]}")
+    return out
+
+
+def _source_geonode() -> List[str]:
+    resp = requests.get(
+        "https://proxylist.geonode.com/api/proxy-list",
+        params={
+            "limit": 500,
+            "page": 1,
+            "sort_by": "lastChecked",
+            "sort_type": "desc",
+            "country": PREFERRED_COUNTRY,
+        },
+        timeout=SOURCE_TIMEOUT,
+        headers={"User-Agent": USER_AGENT},
+    )
+    resp.raise_for_status()
+    out = []
+    for row in resp.json().get("data", []):
+        parsed = _parse_host_port(f"{row.get('ip')}:{row.get('port')}")
+        if not parsed:
+            continue
+        protocols = row.get("protocols") or ["http"]
+        out.append(f"{_scheme_for(protocols[0])}://{parsed[0]}:{parsed[1]}")
+    return out
+
+
+PROXY_SOURCES = {
+    "free-proxy-list": _source_free_proxy_list,
+    "proxyscrape": _source_proxyscrape,
+    "geonode": _source_geonode,
+}
+
+
+def _is_alive(proxy_url: str) -> bool:
+    """
+    Loc nhanh proxy chet bang ket noi TCP tran (dung cho ca http lan socks).
+    Proxy chet chiem phan lon danh sach, ma moi cai ton CONNECT_TIMEOUT giay
+    neu de cho requests tu phat hien -> sang loc truoc, song song, re hon nhieu.
+    """
     try:
-        if "IP:Port" in row.index:
-            raw = str(row["IP:Port"]).strip()
-            if ":" not in raw:
-                return None
-            host, port = raw.rsplit(":", 1)
-        else:
-            host, port = str(row["IP Address"]).strip(), str(row["Port"]).strip()
-
-        # pandas co the doc Port thanh float (8080.0)
-        port = str(int(float(port)))
-        host = host.strip()
-        if not host or not port:
-            return None
-
-        protocol = str(row["Protocol"]).strip().upper() if "Protocol" in row.index else "HTTP"
-        if protocol.startswith("SOCKS"):
-            scheme = "socks5" if "5" in protocol else "socks4"
-        else:
-            scheme = "http"
-
-        return f"{scheme}://{host}:{port}"
-    except (ValueError, TypeError, KeyError):
-        return None
+        host, port = proxy_url.split("://", 1)[1].rsplit(":", 1)
+        with socket.create_connection((host, int(port)), timeout=ALIVE_TIMEOUT):
+            return True
+    except Exception:
+        return False
 
 
 def get_proxies(force_refresh: bool = False) -> List[str]:
     """
-    Tra ve danh sach proxy URL, proxy VN xep truoc.
+    Gom proxy VN tu NHIEU nguon. Mot nguon chet khong lam hong ca danh sach -
+    truoc day chi co free-proxy-list.net, no doi layout HTML la crawler chet im.
 
-    Khac ban cu: KHONG nuot loi tra ve DataFrame rong nua. Danh sach proxy rong
-    dong nghia voi viec khong request nao duoc gui di, crawler se im lang tra ve
-    'No results' nhu the khong co ky quay moi -> phai bao loi that to.
+    Danh sach rong -> raise, vi khong co proxy nghia la khong request nao duoc gui,
+    crawler se im lang tra ve 'No results' y het khi khong co ky quay moi.
     """
     global _proxies_cache
 
@@ -124,34 +217,29 @@ def get_proxies(force_refresh: bool = False) -> List[str]:
         if _proxies_cache is not None and not force_refresh:
             return _proxies_cache
 
-        resp = requests.get(
-            PROXY_LIST_URL,
-            timeout=TIMEOUT,
-            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/117.0"},
-        )
-        resp.raise_for_status()
+        collected: List[str] = []
+        for name, source_fn in PROXY_SOURCES.items():
+            try:
+                found = source_fn()
+                logger.info(f"nguon proxy {name}: {len(found)} proxy {PREFERRED_COUNTRY}")
+                collected.extend(found)
+            except Exception as error:
+                logger.error(f"nguon proxy {name} loi: {type(error).__name__}: {error}")
 
-        table = _find_proxy_table(pd.read_html(StringIO(resp.text)))
+        # giu thu tu xuat hien, bo trung
+        unique = list(dict.fromkeys(collected))
+        if not unique:
+            raise ValueError(f"tat ca {len(PROXY_SOURCES)} nguon proxy deu khong tra ve gi")
 
-        preferred = table[table["Code"] == PREFERRED_COUNTRY]
-        others = table[table["Code"] != PREFERRED_COUNTRY]
+        with ThreadPoolExecutor(max_workers=SCREEN_WORKERS) as pool:
+            alive_flags = list(pool.map(_is_alive, unique))
+        alive = [proxy for proxy, ok in zip(unique, alive_flags) if ok]
 
-        urls: List[str] = []
-        for _, row in pd.concat([preferred, others]).iterrows():
-            url = _to_proxy_url(row)
-            if url and url not in urls:
-                urls.append(url)
+        logger.info(f"proxy: {len(unique)} gom duoc -> {len(alive)} con song")
 
-        logger.info(
-            f"proxy list: {len(preferred)} proxy {PREFERRED_COUNTRY} / {len(urls)} tong cong, "
-            f"se thu toi da {MAX_PROXIES_TO_TRY} cai"
-        )
-
-        if not urls:
-            raise ValueError(f"danh sach proxy rong tu {PROXY_LIST_URL}")
-
-        _proxies_cache = urls
-        return urls
+        # neu sang loc khong con gi thi van thu danh sach goc, con hon khong thu
+        _proxies_cache = alive or unique
+        return _proxies_cache
 
 
 def fetch_wrapper(
@@ -194,23 +282,32 @@ def fetch_wrapper(
                     break
                 if attempt > 0:
                     time.sleep(PROXY_RETRY_SLEEP)
-                # using proxy to avoid ban github ip
-                # tu vong 2 tro di lay lai danh sach proxy moi thay vi dung ban cache
-                all_proxies = get_proxies(force_refresh=True) if attempt else get_proxies()
-                candidates = [p for p in all_proxies if p not in bad_proxies][:MAX_PROXIES_TO_TRY]
 
-                if not candidates:
-                    logger.warning(
-                        f"task {task_id}: khong con proxy kha dung o lan {attempt + 1}/{PROXY_ATTEMPTS} "
-                        f"(bad list={len(bad_proxies)})"
-                    )
-                    continue
+                def _candidates():
+                    # Thu di thang TRUOC, va chi khi that bai moi dung toi danh sach
+                    # proxy - gom + sang loc proxy ton ~20s, khong viec gi phai tra
+                    # cai gia do neu IP cua runner van vao duoc Vietlott.
+                    if attempt == 0 and DIRECT not in bad_proxies:
+                        yield DIRECT
+                    # using proxy to avoid ban github ip
+                    # tu vong 2 tro di lay lai danh sach proxy moi thay vi dung cache
+                    all_proxies = get_proxies(force_refresh=True) if attempt else get_proxies()
+                    used = 0
+                    for proxy_url in all_proxies:
+                        if proxy_url in bad_proxies:
+                            continue
+                        yield proxy_url
+                        used += 1
+                        if used >= MAX_PROXIES_TO_TRY:
+                            return
 
-                for str_proxy in candidates:
+                tried = 0
+                for str_proxy in _candidates():
+                    tried += 1
                     if time.monotonic() > deadline:
                         logger.warning(f"task {task_id}: het ngan sach thoi gian giua vong proxy")
                         break
-                    proxy = {"http": str_proxy, "https": str_proxy}
+                    proxy = None if str_proxy == DIRECT else {"http": str_proxy, "https": str_proxy}
 
                     try:
                         res = requests.post(
@@ -226,6 +323,11 @@ def fetch_wrapper(
                         if not res.ok:
                             banned_message = "You are unable to access"
                             if banned_message in res.text:
+                                if str_proxy == DIRECT:
+                                    logger.warning(
+                                        "KET NOI TRUC TIEP BI CHAN - dung proxy la dung, "
+                                        "gia dinh ban dau chinh xac"
+                                    )
                                 logger.error(
                                     f"req failed, args={task_data}, code={res.status_code}, "
                                     f"proxy={str_proxy}, res='Banned IP!!!'"
@@ -241,6 +343,11 @@ def fetch_wrapper(
                         try:
                             result = process_result_fn(params, body, res.json(), task_data)
                             results.append(result)
+                            if str_proxy == DIRECT:
+                                logger.info(
+                                    "KET NOI TRUC TIEP THANH CONG - IP cua runner KHONG bi chan, "
+                                    "co the bo han tang proxy"
+                                )
                             logger.debug(f"task {task_id}, proxy={str_proxy} done")
                             done = True
                             break  # break the proxy loop
@@ -260,7 +367,7 @@ def fetch_wrapper(
                     break
 
                 logger.warning(
-                    f"task {task_id}: thu het {len(candidates)} proxy o lan {attempt + 1}/{PROXY_ATTEMPTS}"
+                    f"task {task_id}: thu het {tried} duong o lan {attempt + 1}/{PROXY_ATTEMPTS}"
                 )
 
             if not done:
