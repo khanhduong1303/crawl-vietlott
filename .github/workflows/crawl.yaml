@@ -23,7 +23,7 @@ jobs:
 
     strategy:
       matrix:
-        python-version: [ 3.12.3 ] # upgrade python while ubuntu-latest = 24.04
+        python-version: [ '3.12' ] # do NOT pin patch version: new Ubuntu images only ship recent patches
 
     steps:
       - uses: actions/checkout@v4
