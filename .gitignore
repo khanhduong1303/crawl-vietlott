@@ -164,3 +164,5 @@ cython_debug/
 
 # local helper script (personal push), not part of the project
 push-personal.sh
+ci-log.sh
+ci-logs/

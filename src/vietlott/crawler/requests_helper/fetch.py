@@ -37,6 +37,17 @@ MAX_PROXIES_TO_TRY = 30
 # chung gia dinh 'IP GitHub bi Vietlott chan' - gia dinh nay chua ai kiem lai.
 DIRECT = "direct"
 
+# Vietlott nam sau Cloudflare. Trang chan that su tra ve 'Just a moment...' (JS
+# challenge), KHONG phai 'You are unable to access' nhu code cu cho rang - nen
+# nhanh nhan dien ban truoc gio chua bao gio chay.
+BLOCK_MARKERS = (
+    "You are unable to access",
+    "Just a moment",
+    "Attention Required",
+    "cf-browser-verification",
+    "Checking your browser",
+)
+
 # Proxy free chet rat nhanh, pool VN thay doi tung phut -> neu vong dau that bai
 # thi lay lai danh sach moi roi thu them mot vong nua.
 PROXY_ATTEMPTS = 3
@@ -75,6 +86,11 @@ def get_vietlott_cookie() -> Tuple[str, dict]:
     cookie = match.group(1)
     cookies = {cookie.split("=")[0]: cookie.split("=")[1]}
     return cookie, cookies
+
+
+def _looks_blocked(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(marker.lower() in lowered for marker in BLOCK_MARKERS)
 
 
 def _parse_host_port(raw: str):
@@ -321,16 +337,15 @@ def fetch_wrapper(
                         )
 
                         if not res.ok:
-                            banned_message = "You are unable to access"
-                            if banned_message in res.text:
+                            if _looks_blocked(res.text):
                                 if str_proxy == DIRECT:
                                     logger.warning(
-                                        "KET NOI TRUC TIEP BI CHAN - dung proxy la dung, "
-                                        "gia dinh ban dau chinh xac"
+                                        f"KET NOI TRUC TIEP BI CHAN (code={res.status_code}, "
+                                        f"bot protection) - bat buoc phai di qua proxy"
                                     )
                                 logger.error(
                                     f"req failed, args={task_data}, code={res.status_code}, "
-                                    f"proxy={str_proxy}, res='Banned IP!!!'"
+                                    f"proxy={str_proxy}, res='Bi chan boi bot protection'"
                                 )
                             else:
                                 logger.error(
@@ -360,7 +375,14 @@ def fetch_wrapper(
 
                     # handle exception on request
                     except Exception as error:
-                        logger.debug(f"{type(error).__name__}, task {task_id}, proxy={str_proxy}")
+                        if str_proxy == DIRECT:
+                            # chi xay ra 1 lan/task, dang de thay; con proxy thi hang chuc
+                            # cai hong moi lan chay, de WARNING se ngap log
+                            logger.warning(
+                                f"KET NOI TRUC TIEP LOI: {type(error).__name__}: {error}"
+                            )
+                        else:
+                            logger.debug(f"{type(error).__name__}, task {task_id}, proxy={str_proxy}")
                         add_to_bad_list(str_proxy)
 
                 if done:
