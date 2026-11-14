@@ -2,8 +2,10 @@ name: Crawling
 
 on:
   workflow_dispatch: # allow manual run
-#  push:
-#    branches: master
+  # TEMP: tu dong chay CI khi push len nhanh test.
+  # PHAI XOA 3 dong duoi truoc khi merge vao master.
+  push:
+    branches: [ fix/ci-crawler ]
   schedule:
     - cron: '0 18 * * *' # 01:00 VNT
     - cron: '0 0 * * *'  # 07:00 VNT

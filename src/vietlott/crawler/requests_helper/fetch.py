@@ -3,27 +3,34 @@ fetch data utilities
 """
 
 import re
-from typing import Callable, Optional, Tuple
-
-import requests
-# from requests.exceptions import ProxyError, ReadTimeout, ConnectionError
-# import urllib3
-# from urllib3.exceptions import SSLError, InsecureRequestWarning, ConnectTimeoutError, NewConnectionError, ReadTimeoutError, MaxRetryError, TimeoutError, ConnectionError
-# urllib3.disable_warnings(ConnectTimeoutError)
-# urllib3.disable_warnings(NewConnectionError)
+import threading
+from io import StringIO
+from typing import Callable, List, Optional, Tuple
 
 import pandas as pd
-from io import StringIO
+import requests
+from loguru import logger
 
 from vietlott.crawler.requests_helper.config import TIMEOUT
 
-from loguru import logger
+PROXY_LIST_URL = "https://free-proxy-list.net/"
 
-import threading
+# Vietlott chan IP datacenter nuoc ngoai (IP cua GitHub Actions nam trong so do),
+# nen uu tien proxy VN; proxy nuoc khac chi la phuong an cuoi.
+PREFERRED_COUNTRY = "VN"
 
+# Moi proxy chet ton toi TIMEOUT giay. Danh sach co ~300 proxy, neu thu het
+# thi mot lan crawl co the keo dai hang gio -> bat buoc phai gioi han.
+MAX_PROXIES_TO_TRY = 25
 
 bad_proxies = []
 lock = threading.Lock()
+
+# get_proxies() duoc goi nhieu lan trong mot lan chay -> cache lai de khong
+# spam free-proxy-list.net va de thu tu proxy on dinh giua cac task.
+_proxies_cache: Optional[List[str]] = None
+_proxies_cache_lock = threading.Lock()
+
 
 def get_vietlott_cookie() -> Tuple[str, dict]:
     res = requests.get("https://vietlott.vn/ajaxpro/")
@@ -33,6 +40,96 @@ def get_vietlott_cookie() -> Tuple[str, dict]:
     cookie = match.group(1)
     cookies = {cookie.split("=")[0]: cookie.split("=")[1]}
     return cookie, cookies
+
+
+def _find_proxy_table(tables: List[pd.DataFrame]) -> pd.DataFrame:
+    """
+    free-proxy-list.net doi layout theo thoi gian: bang dau tien khong con la bang
+    proxy day du, va 2 cot 'IP Address' / 'Port' da bi gop thanh mot cot 'IP:Port'.
+    Vi vay tim bang theo TEN COT thay vi hardcode index [0] nhu truoc.
+    """
+    for table in tables:
+        cols = set(table.columns)
+        has_address = ({"IP Address", "Port"} <= cols) or ("IP:Port" in cols)
+        if has_address and "Code" in cols:
+            return table
+
+    raise ValueError(
+        f"khong tim thay bang proxy tren {PROXY_LIST_URL}, "
+        f"cac bang doc duoc: {[list(t.columns) for t in tables]}"
+    )
+
+
+def _to_proxy_url(row: pd.Series) -> Optional[str]:
+    """Chuyen mot dong cua bang proxy thanh URL co scheme, vd http://1.2.3.4:8080"""
+    try:
+        if "IP:Port" in row.index:
+            raw = str(row["IP:Port"]).strip()
+            if ":" not in raw:
+                return None
+            host, port = raw.rsplit(":", 1)
+        else:
+            host, port = str(row["IP Address"]).strip(), str(row["Port"]).strip()
+
+        # pandas co the doc Port thanh float (8080.0)
+        port = str(int(float(port)))
+        host = host.strip()
+        if not host or not port:
+            return None
+
+        protocol = str(row["Protocol"]).strip().upper() if "Protocol" in row.index else "HTTP"
+        if protocol.startswith("SOCKS"):
+            scheme = "socks5" if "5" in protocol else "socks4"
+        else:
+            scheme = "http"
+
+        return f"{scheme}://{host}:{port}"
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+def get_proxies(force_refresh: bool = False) -> List[str]:
+    """
+    Tra ve danh sach proxy URL, proxy VN xep truoc.
+
+    Khac ban cu: KHONG nuot loi tra ve DataFrame rong nua. Danh sach proxy rong
+    dong nghia voi viec khong request nao duoc gui di, crawler se im lang tra ve
+    'No results' nhu the khong co ky quay moi -> phai bao loi that to.
+    """
+    global _proxies_cache
+
+    with _proxies_cache_lock:
+        if _proxies_cache is not None and not force_refresh:
+            return _proxies_cache
+
+        resp = requests.get(
+            PROXY_LIST_URL,
+            timeout=TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/117.0"},
+        )
+        resp.raise_for_status()
+
+        table = _find_proxy_table(pd.read_html(StringIO(resp.text)))
+
+        preferred = table[table["Code"] == PREFERRED_COUNTRY]
+        others = table[table["Code"] != PREFERRED_COUNTRY]
+
+        urls: List[str] = []
+        for _, row in pd.concat([preferred, others]).iterrows():
+            url = _to_proxy_url(row)
+            if url and url not in urls:
+                urls.append(url)
+
+        logger.info(
+            f"proxy list: {len(preferred)} proxy {PREFERRED_COUNTRY} / {len(urls)} tong cong, "
+            f"se thu toi da {MAX_PROXIES_TO_TRY} cai"
+        )
+
+        if not urls:
+            raise ValueError(f"danh sach proxy rong tu {PROXY_LIST_URL}")
+
+        _proxies_cache = urls
+        return urls
 
 
 def fetch_wrapper(
@@ -58,8 +155,7 @@ def fetch_wrapper(
         logger.debug(f"worker start, tasks_ids={tasks_str}")
         _headers = headers.copy()
         # using proxy to avoid ban github ip
-        proxies = get_proxies()
-        # print(proxies)
+        all_proxies = get_proxies()
 
         results = []
         for task in tasks:
@@ -70,12 +166,14 @@ def fetch_wrapper(
             params.update(task_data["params"])
             body.update(task_data["body"])
 
-            for index, row in proxies.iterrows():
-                str_proxy = f"{row['IP Address']}:{row['Port']}"
-                if str_proxy in bad_proxies: continue
-                # print(f"proxy: {str_proxy}")
+            candidates = [p for p in all_proxies if p not in bad_proxies][:MAX_PROXIES_TO_TRY]
+            if not candidates:
+                logger.error(f"task {task_id}: khong con proxy nao kha dung (bad list={len(bad_proxies)})")
+                continue
 
-                proxy = { "http": str_proxy, "https": str_proxy }
+            done = False
+            for str_proxy in candidates:
+                proxy = {"http": str_proxy, "https": str_proxy}
 
                 try:
                     res = requests.post(
@@ -85,60 +183,51 @@ def fetch_wrapper(
                         headers=_headers,
                         cookies=cookies,
                         timeout=TIMEOUT,
-                        proxies=proxy
+                        proxies=proxy,
                     )
 
                     if not res.ok:
-                        bannedMess = "You are unable to access"
-                        if bannedMess in res.text:
+                        banned_message = "You are unable to access"
+                        if banned_message in res.text:
                             logger.error(
-                                # f"req failed, args={task_data}, code={res.status_code}, headers={_headers}, params={params}, body={body}, res={res.text}, text={res.text[:200]}"
-                                f"req failed, args={task_data}, code={res.status_code}, proxy={str_proxy}, res='Banned IP!!!'"
+                                f"req failed, args={task_data}, code={res.status_code}, "
+                                f"proxy={str_proxy}, res='Banned IP!!!'"
                             )
                         else:
                             logger.error(
-                                # f"req failed, args={task_data}, code={res.status_code}, headers={_headers}, params={params}, body={body}, res={res.text}, text={res.text[:200]}"
-                                f"req failed, args={task_data}, code={res.status_code}, proxy={str_proxy}, res={res.text}"
+                                f"req failed, args={task_data}, code={res.status_code}, "
+                                f"proxy={str_proxy}, res={res.text[:200]}"
                             )
                         add_to_bad_list(str_proxy)
                         continue
+
                     try:
                         result = process_result_fn(params, body, res.json(), task_data)
                         results.append(result)
                         logger.debug(f"task {task_id}, proxy={str_proxy} done")
-                        break # break the proxy loop
+                        done = True
+                        break  # break the proxy loop
                     except Exception as error:
                         logger.error(
-                            f"{type(error).__name__}, args={task_data}, text={res.text[:200]}, headers={headers}, cookies={cookies}, body={body}, params={params}"
+                            f"{type(error).__name__}, args={task_data}, text={res.text[:200]}, "
+                            f"headers={headers}, cookies={cookies}, body={body}, params={params}"
                         )
+                        add_to_bad_list(str_proxy)
 
                 # handle exception on request
                 except Exception as error:
-                    # logger.error(f"{type(error).__name__}, task {task_id}, proxy={str_proxy}, error={error}")
-                    logger.error(f"{type(error).__name__}, task {task_id}, proxy={str_proxy}")
+                    logger.debug(f"{type(error).__name__}, task {task_id}, proxy={str_proxy}")
                     add_to_bad_list(str_proxy)
+
+            if not done:
+                logger.error(
+                    f"task {task_id}: thu het {len(candidates)} proxy deu that bai"
+                )
 
         logger.debug(f"worker done, tasks={tasks_str}")
         return results
 
     return fetch
-
-
-def get_proxies():
-    try:
-        resp = requests.get('https://free-proxy-list.net/')
-        resp.raise_for_status()
-        df = pd.read_html(StringIO(resp.text))[0]
-        # df = df[(df['Anonymity'] == 'elite proxy') & (df['Https'] == 'yes') & (df['Code'] == 'VN')]
-        # # sort the 'VN' first
-        # df['Order'] = df['Code'].apply(lambda x: 0 if x == 'VN' else 1)
-        # df = df.sort_values(by='Order').drop('Order', axis=1)
-        # get only VN proxies
-        df = df[(df['Code'] == 'VN')]
-    except Exception as e:
-        logger.error(f"Failed to fetch proxy list: {e}")
-        return pd.DataFrame()  # return an empty DataFrame or handle it as needed
-    return df
 
 
 def add_to_bad_list(item):

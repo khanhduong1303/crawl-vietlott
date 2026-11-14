@@ -36,7 +36,8 @@ class Predictor2():
         train_data = data[:int(0.8*len(data))]
         val_data = data[int(0.8*len(data)):]
         # Get the maximum value in the data
-        max_value = np.max(data)
+        # keras >= 3.x bat buoc int thuan, np.max() tra ve numpy.int64 -> phai ep kieu
+        max_value = int(np.max(data))
         
         # Get number of features from training data 
         num_features = train_data.shape[1]
